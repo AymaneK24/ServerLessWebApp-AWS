@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Item HTTP API with Lambda integration and DynamoDB.
+
+Resources:
+  ItemDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: all-items
+      AttributeDefinitions:
+        - AttributeName: 'itemId'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'itemId'
+          KeyType: 'HASH'
+      BillingMode: PAY_PER_REQUEST
+
+  ItemAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: items-api
+      ProtocolType: HTTP
+      Description: HTTP API for Items
+
+  ItemLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ItemLambdaFunction
+      Runtime: nodejs18.x
+      Role: !GetAtt ItemFunctionExecutionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          const dynamo = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            let body;
+            let statusCode = 200;
+            const headers = { "Content-Type": "application/json" };
+
+            try {
+              switch (event.routeKey) {
+                case "DELETE /items/{id}":
+                  await dynamo.delete({
+                    TableName: "all-items",
+                    Key: { itemId: event.pathParameters.id }
+                  }).promise();
+                  body = `Deleted item ${event.pathParameters.id}`;
+                  break;
+                case "GET /items/{id}":
+                  body = await dynamo.get({
+                    TableName: "all-items",
+                    Key: { itemId: event.pathParameters.id }
+                  }).promise();
+                  break;
+                case "GET /items":
+                  body = await dynamo.scan({ TableName: "all-items" }).promise();
+                  break;
+                case "PUT /items":
+                  let requestJSON = JSON.parse(event.body);
+                  await dynamo.put({
+                    TableName: "all-items",
+                    Item: {
+                      itemId: requestJSON.itemId,
+                      price: requestJSON.price,
+                      name: requestJSON.name
+                    }
+                  }).promise();
+                  body = `Put item ${requestJSON.itemId}`;
+                  break;
+                default:
+                  throw new Error(`Unsupported route: "${event.routeKey}"`);
+              }
+            } catch (err) {
+              statusCode = 400;
+              body = err.message;
+            }
+
+            return { statusCode, body: JSON.stringify(body), headers };
+          };
+
+  APIIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ItemAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ItemLambdaFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  APIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ItemAPI
+      RouteKey: '$default'
+      Target: !Sub integrations/${APIIntegration}
+
+  APIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ItemAPI
+      StageName: '$default'
+      AutoDeploy: true
+
+  APIInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ItemLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ItemAPI}/*/*
+
+  ItemFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: LambdaDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ItemDynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+Outputs:
+  InvokeURL:
+    Value: !Sub https://${ItemAPI}.execute-api.${AWS::Region}.amazonaws.com/$default/
